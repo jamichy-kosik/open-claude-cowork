@@ -5,17 +5,18 @@ const SERVER_URL = 'http://localhost:3001';
 // Expose safe API to renderer process via contextBridge
 contextBridge.exposeInMainWorld('electronAPI', {
   // Send a chat message to the backend with chat ID for session management
-  sendMessage: async (message, chatId) => {
+  sendMessage: async (message, chatId, attachments = []) => {
     return new Promise((resolve, reject) => {
       console.log('[PRELOAD] Sending message to backend:', message);
       console.log('[PRELOAD] Chat ID:', chatId);
+      console.log('[PRELOAD] Attachments:', attachments.length);
 
       fetch(`${SERVER_URL}/api/chat`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ message, chatId })
+        body: JSON.stringify({ message, chatId, attachments })
       })
         .then(response => {
           if (!response.ok) {

@@ -124,6 +124,34 @@ COMPOSIO_API_KEY=your-composio-api-key
 
 ### Starting the Application
 
+#### Option 1: Docker (Recommended)
+
+The easiest way to run the application:
+
+```bash
+# Start the application in Docker
+docker-compose up --build
+```
+
+The application will be available at `http://localhost:3001`
+
+**Docker Commands:**
+```bash
+# Start in background
+docker-compose up -d
+
+# View logs
+docker logs open-claude-cowork-app-1 -f
+
+# Stop the application
+docker-compose down
+
+# Rebuild after changes
+docker-compose up --build
+```
+
+#### Option 2: Local Development
+
 You need **two terminal windows**:
 
 **Terminal 1 - Backend Server:**
@@ -136,6 +164,8 @@ npm start
 ```bash
 npm start
 ```
+
+Access the web version at `http://localhost:3001` or use the Electron desktop app.
 
 ---
 
@@ -218,13 +248,19 @@ open-claude-cowork/
 
 ## Troubleshooting
 
+**Docker: "Claude Code process exited with code 1"**
+- This was caused by running as root user - now fixed with non-root user in Dockerfile
+- If you still see this, ensure you're using the latest version: `docker-compose up --build`
+
 **"Failed to connect to backend"**
 - Ensure backend server is running on port 3001
 - Check Terminal 1 for error logs
+- If using Docker, check logs: `docker logs open-claude-cowork-app-1`
 
 **"API key error"**
 - Verify `ANTHROPIC_API_KEY` in `.env` starts with `sk-ant-`
 - Ensure `COMPOSIO_API_KEY` is valid
+- For Docker, make sure `.env` file exists in the project root
 
 **"Session not persisting"**
 - Check server logs for session ID capture

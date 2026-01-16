@@ -1,0 +1,21 @@
+services:
+  app:
+    build: .
+    ports:
+      - "3001:3001"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - COMPOSIO_API_KEY=${COMPOSIO_API_KEY}
+      - PORT=3001
+    volumes:
+      # Mount .claude/skills for skills support
+      - ./.claude:/app/.claude:ro
+      # Mount uploads directory
+      - ./server/uploads:/app/server/uploads
+    restart: unless-stopped
+    networks:
+      - claude-network
+
+networks:
+  claude-network:
+    driver: bridge

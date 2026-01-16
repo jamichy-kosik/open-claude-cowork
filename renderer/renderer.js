@@ -59,10 +59,16 @@ function saveState() {
   const chatData = {
     id: currentChatId,
     title: chatTitle.textContent,
-    messages: Array.from(chatMessages.children).map(msg => ({
-      class: msg.className,
-      content: msg.querySelector('.message-content')?.dataset.rawContent || msg.querySelector('.message-content')?.textContent || ''
-    })),
+    messages: Array.from(chatMessages.children).map(msg => {
+      const contentDiv = msg.querySelector('.message-content');
+      const usageInfo = msg.querySelector('.usage-info');
+      return {
+        class: msg.className,
+        content: contentDiv?.dataset.rawContent || contentDiv?.textContent || '',
+        contentHtml: contentDiv ? contentDiv.innerHTML : null,
+        usageHtml: usageInfo ? usageInfo.innerHTML : null
+      };
+    }),
     todos,
     toolCalls,
     updatedAt: Date.now()
@@ -127,10 +133,24 @@ function loadChat(chat) {
     if (msgData.class.includes('user')) {
       contentDiv.textContent = msgData.content;
     } else if (msgData.class.includes('assistant')) {
-      renderMarkdown(contentDiv);
+      // If we have saved HTML (with tool calls), use it
+      if (msgData.contentHtml) {
+        contentDiv.innerHTML = msgData.contentHtml;
+      } else {
+        // Fallback to rendering markdown from raw content
+        renderMarkdown(contentDiv);
+      }
     }
 
     messageDiv.appendChild(contentDiv);
+
+    // Restore usage info if it exists (and not already in contentHtml)
+    if (msgData.usageHtml && !contentDiv.querySelector('.usage-info')) {
+      const usageDiv = document.createElement('div');
+      usageDiv.className = 'usage-info';
+      usageDiv.innerHTML = msgData.usageHtml;
+      contentDiv.appendChild(usageDiv);
+    }
 
     if (msgData.class.includes('assistant')) {
       const actionsDiv = document.createElement('div');
@@ -346,23 +366,20 @@ function handleFileSelect(event, context) {
       return;
     }
 
-    // Read file as base64 for images or text
+    // Read file as base64 for all files
     const reader = new FileReader();
     reader.onload = (e) => {
       attachedFiles.push({
         name: file.name,
         type: file.type,
         size: file.size,
-        data: e.target.result
+        data: e.target.result // Always base64
       });
       renderAttachedFiles(context);
     };
 
-    if (file.type.startsWith('image/')) {
-      reader.readAsDataURL(file);
-    } else {
-      reader.readAsText(file);
-    }
+    // Always read as data URL (base64) to preserve binary data
+    reader.readAsDataURL(file);
   });
 
   // Reset input
@@ -450,13 +467,19 @@ async function handleSendMessage(e) {
     chatTitle.textContent = message.length > 30 ? message.substring(0, 30) + '...' : message;
   }
 
-  // Add user message
-  addUserMessage(message);
+  // Copy attachments before clearing
+  const messageAttachments = [...attachedFiles];
+  
+  // Add user message with attachments
+  addUserMessage(message, messageAttachments);
 
-  // Clear input
+  // Clear input and attachments
   input.value = '';
   updateSendButton(input, homeSendBtn);
   updateSendButton(messageInput, chatSendBtn);
+  
+  attachedFiles = [];
+  renderAttachedFiles(isFirstMessage ? 'home' : 'chat');
 
   // Set loading state
   isWaitingForResponse = true;
@@ -466,9 +489,25 @@ async function handleSendMessage(e) {
   const contentDiv = assistantMessage.querySelector('.message-content');
 
   try {
-    // Pass chatId for session management
-    const response = await window.electronAPI.sendMessage(message, currentChatId);
-    const reader = await response.getReader();
+    // Send message via fetch API (works in both Electron and web)
+    const response = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        message,
+        chatId: currentChatId,
+        attachments: messageAttachments
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
     let buffer = '';
     let hasContent = false;
     let receivedStreamingText = false;
@@ -492,7 +531,7 @@ async function handleSendMessage(e) {
         break;
       }
 
-      buffer += value;
+      buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines[lines.length - 1];
 
@@ -506,6 +545,9 @@ async function handleSendMessage(e) {
 
             if (data.type === 'done') {
               break;
+            } else if (data.type === 'usage') {
+              // Display usage and cost information
+              displayUsageInfo(assistantMessage, data.usage, data.cost);
             } else if (data.type === 'text' && data.content) {
               if (!hasContent) {
                 const loadingIndicator = contentDiv.querySelector('.loading-indicator');
@@ -515,11 +557,13 @@ async function handleSendMessage(e) {
               receivedStreamingText = true;
               appendToContent(contentDiv, data.content);
             } else if (data.type === 'tool_use') {
+              console.log('[FRONTEND] Tool use detected:', data.name);
               const toolName = data.name || data.tool || 'Tool';
               const toolInput = data.input || {};
               const apiId = data.id; // API's tool ID
+              const usage = data.usage; // Get usage info
               const toolCall = addToolCall(toolName, toolInput, 'running');
-              addInlineToolCall(contentDiv, toolName, toolInput, toolCall.id);
+              addInlineToolCall(contentDiv, toolName, toolInput, toolCall.id, usage);
               if (apiId) {
                 pendingToolCalls.set(apiId, toolCall.id);
               }
@@ -542,6 +586,10 @@ async function handleSendMessage(e) {
                 if (loadingIndicator) loadingIndicator.remove();
               }
               hasContent = true;
+            } else if (data.type === 'permission_request') {
+              console.log('[FRONTEND] Permission request received:', data);
+              // Show permission dialog
+              showPermissionDialog(data.requestId, data.tool, data.input);
             } else if (data.type === 'assistant' && data.message) {
               if (data.message.content && Array.isArray(data.message.content)) {
                 for (const block of data.message.content) {
@@ -602,7 +650,7 @@ async function handleSendMessage(e) {
 }
 
 // Add user message to chat
-function addUserMessage(text) {
+function addUserMessage(text, attachments = []) {
   const messageDiv = document.createElement('div');
   messageDiv.className = 'message user';
 
@@ -611,9 +659,49 @@ function addUserMessage(text) {
   contentDiv.textContent = text;
 
   messageDiv.appendChild(contentDiv);
+  
+  // Add attachments display if any
+  if (attachments && attachments.length > 0) {
+    const attachmentsDiv = document.createElement('div');
+    attachmentsDiv.className = 'message-attachments';
+    attachmentsDiv.style.cssText = 'margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px;';
+    
+    attachments.forEach(file => {
+      const fileDiv = document.createElement('div');
+      fileDiv.style.cssText = 'display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; background: rgba(255,255,255,0.1); border-radius: 6px; font-size: 13px; border: 1px solid rgba(255,255,255,0.1);';
+      
+      // File icon
+      const icon = document.createElement('span');
+      icon.textContent = file.type.startsWith('image/') ? '🖼️' : '📄';
+      
+      // File name
+      const name = document.createElement('span');
+      name.textContent = file.name;
+      name.style.cssText = 'max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;';
+      
+      // File size
+      const size = document.createElement('span');
+      size.textContent = formatFileSize(file.size);
+      size.style.cssText = 'color: rgba(255,255,255,0.6); font-size: 11px;';
+      
+      fileDiv.appendChild(icon);
+      fileDiv.appendChild(name);
+      fileDiv.appendChild(size);
+      attachmentsDiv.appendChild(fileDiv);
+    });
+    
+    messageDiv.appendChild(attachmentsDiv);
+  }
+  
   chatMessages.appendChild(messageDiv);
   scrollToBottom();
   saveState();
+}
+
+function formatFileSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
 // Create assistant message with loading state
@@ -652,6 +740,56 @@ function createAssistantMessage() {
   saveState();
 
   return messageDiv;
+}
+
+// Display usage and cost information
+function displayUsageInfo(messageDiv, usage, cost) {
+  try {
+    // Validate inputs
+    if (!usage || !cost) {
+      console.warn('Missing usage or cost data');
+      return;
+    }
+    
+    // Check if usage info already exists
+    let usageDiv = messageDiv.querySelector('.usage-info');
+    if (!usageDiv) {
+      usageDiv = document.createElement('div');
+      usageDiv.className = 'usage-info';
+      const contentDiv = messageDiv.querySelector('.message-content');
+      if (!contentDiv) {
+        console.error('Could not find message-content div');
+        return;
+      }
+      contentDiv.appendChild(usageDiv);
+    }
+
+    const totalTokens = (usage.input_tokens || 0) + (usage.output_tokens || 0);
+    const hasCacheTokens = (usage.cache_creation_input_tokens || 0) > 0 || (usage.cache_read_input_tokens || 0) > 0;
+
+    usageDiv.innerHTML = `
+      <div style="display: flex; gap: 20px; align-items: center; flex-wrap: wrap;">
+        <div style="display: flex; gap: 8px; align-items: baseline;">
+          <span style="font-size: 14px;">📊</span>
+          <span style="font-size: 16px; font-weight: 600; color: #1a1a1a;">${totalTokens.toLocaleString()}</span>
+          <span style="font-size: 13px; color: #6b6b6b;">tokens</span>
+        </div>
+        <div style="display: flex; gap: 8px; align-items: baseline;">
+          <span style="font-size: 14px;">💰</span>
+          <span style="font-size: 16px; font-weight: 600; color: #2563eb;">$${(cost.total || 0).toFixed(4)}</span>
+        </div>
+      </div>
+      <div style="margin-top: 6px; font-size: 12px; color: #6b6b6b; line-height: 1.6;">
+        <div style="display: flex; gap: 16px; flex-wrap: wrap;">
+          <span>${(usage.input_tokens || 0).toLocaleString()} in <span style="color: #9a9a9a;">($${(cost.input || 0).toFixed(4)})</span></span>
+          <span>${(usage.output_tokens || 0).toLocaleString()} out <span style="color: #9a9a9a;">($${(cost.output || 0).toFixed(4)})</span></span>
+        </div>
+        ${hasCacheTokens ? `<div style="margin-top: 4px;">Cache: ${(usage.cache_read_input_tokens || 0).toLocaleString()} read + ${(usage.cache_creation_input_tokens || 0).toLocaleString()} write <span style="color: #9a9a9a;">($${((cost.cache_read || 0) + (cost.cache_write || 0)).toFixed(4)})</span></div>` : ''}
+      </div>
+    `;
+  } catch (error) {
+    console.error('Error displaying usage info:', error);
+  }
 }
 
 function appendToContent(contentDiv, content) {
@@ -774,13 +912,34 @@ function formatToolPreview(toolInput) {
 }
 
 // Add inline tool call to message (maintains correct order in stream)
-function addInlineToolCall(contentDiv, toolName, toolInput, toolId) {
+function addInlineToolCall(contentDiv, toolName, toolInput, toolId, usage = null) {
   const toolDiv = document.createElement('div');
   toolDiv.className = 'inline-tool-call expanded'; // Show expanded by default
   toolDiv.dataset.toolId = toolId;
 
   const inputPreview = formatToolPreview(toolInput);
   const inputStr = JSON.stringify(toolInput, null, 2);
+
+  // Create usage HTML if usage info is provided
+  let usageHtml = '';
+  if (usage) {
+    const inputTokens = (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0);
+    const outputTokens = usage.output_tokens || 0;
+    const totalTokens = inputTokens + outputTokens;
+    
+    const inputCost = ((usage.input_tokens || 0) * 3 + (usage.cache_creation_input_tokens || 0) * 3.75 + (usage.cache_read_input_tokens || 0) * 0.30) / 1000000;
+    const outputCost = (usage.output_tokens || 0) * 15 / 1000000;
+    const totalCost = inputCost + outputCost;
+    
+    usageHtml = `
+      <div class="usage-info" style="margin-top: 8px; font-size: 11px; color: #1a1a1a;">
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <span>📊 ${totalTokens.toLocaleString()} tokens</span>
+          <span>💰 $${totalCost.toFixed(4)}</span>
+        </div>
+      </div>
+    `;
+  }
 
   toolDiv.innerHTML = `
     <div class="inline-tool-header" onclick="toggleInlineToolCall(this)">
@@ -793,6 +952,7 @@ function addInlineToolCall(contentDiv, toolName, toolInput, toolId) {
         <polyline points="6 9 12 15 18 9"></polyline>
       </svg>
     </div>
+    ${usageHtml}
     <div class="inline-tool-result">
       <div class="tool-section">
         <div class="tool-section-label">Input</div>
@@ -820,8 +980,19 @@ function updateInlineToolResult(toolId, result) {
     const outputSection = toolDiv.querySelector('.tool-output-section');
     const outputContent = toolDiv.querySelector('.tool-output-content');
     if (outputSection && outputContent) {
-      const resultStr = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
-      outputContent.textContent = resultStr.substring(0, 2000) + (resultStr.length > 2000 ? '...' : '');
+      let resultStr = '';
+      if (typeof result === 'object') {
+        resultStr = JSON.stringify(result, null, 2);
+      } else {
+        resultStr = String(result);
+      }
+      
+      // Show full result up to 5000 characters
+      const maxLength = 5000;
+      const displayStr = resultStr.substring(0, maxLength);
+      const truncated = resultStr.length > maxLength;
+      
+      outputContent.textContent = displayStr + (truncated ? '\n\n... (truncated)' : '');
       outputSection.style.display = 'block';
     }
   }
@@ -1014,6 +1185,106 @@ function getConversationHistory() {
 // Scroll to bottom of messages
 function scrollToBottom() {
   chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+// Show permission dialog for tool use
+function showPermissionDialog(requestId, toolName, toolInput) {
+  // Create overlay
+  const overlay = document.createElement('div');
+  overlay.className = 'permission-overlay';
+  overlay.style.cssText = `
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 10000;
+  `;
+  
+  // Create dialog
+  const dialog = document.createElement('div');
+  dialog.className = 'permission-dialog';
+  dialog.style.cssText = `
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 24px;
+    max-width: 600px;
+    width: 90%;
+    max-height: 80vh;
+    overflow-y: auto;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  `;
+  
+  const inputStr = JSON.stringify(toolInput, null, 2);
+  
+  dialog.innerHTML = `
+    <h3 style="margin: 0 0 16px 0; color: var(--text-primary);">Tool Permission Request</h3>
+    <p style="margin: 0 0 12px 0; color: var(--text-secondary);">
+      Agent wants to use: <strong>${escapeHtml(toolName)}</strong>
+    </p>
+    <div style="background: var(--bg-primary); padding: 12px; border-radius: 4px; margin-bottom: 20px; max-height: 300px; overflow-y: auto;">
+      <pre style="margin: 0; font-size: 12px; color: var(--text-primary); white-space: pre-wrap;">${escapeHtml(inputStr)}</pre>
+    </div>
+    <div style="display: flex; gap: 12px; justify-content: flex-end;">
+      <button id="deny-btn" style="
+        padding: 8px 20px;
+        border: 1px solid var(--border-color);
+        background: var(--bg-secondary);
+        color: var(--text-primary);
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 14px;
+      ">Deny</button>
+      <button id="approve-btn" style="
+        padding: 8px 20px;
+        border: none;
+        background: #10a37f;
+        color: white;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 14px;
+      ">Approve</button>
+    </div>
+  `;
+  
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+  
+  // Handle buttons
+  const approveBtn = dialog.querySelector('#approve-btn');
+  const denyBtn = dialog.querySelector('#deny-btn');
+  
+  approveBtn.onclick = async () => {
+    await sendPermissionResponse(requestId, true);
+    overlay.remove();
+  };
+  
+  denyBtn.onclick = async () => {
+    await sendPermissionResponse(requestId, false);
+    overlay.remove();
+  };
+}
+
+// Send permission response to backend
+async function sendPermissionResponse(requestId, allowed) {
+  try {
+    const response = await fetch('/api/permission', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requestId, allowed })
+    });
+    
+    if (!response.ok) {
+      console.error('Failed to send permission response');
+    }
+  } catch (error) {
+    console.error('Error sending permission response:', error);
+  }
 }
 
 // Initialize on load

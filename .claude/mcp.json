@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "snowflake-ml-reporting": {
+      "type": "http",
+      "url": "https://lvourab-yr02508.snowflakecomputing.com/api/v2/databases/KOSIK/schemas/ML_REPORTING/mcp-servers/KOSIK_ML_REPORTING_MCP",
+      "headers": {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Authorization": "Bearer ${SNOWFLAKE_MCP_TOKEN}"
+      }
+    }
+  }
+}
